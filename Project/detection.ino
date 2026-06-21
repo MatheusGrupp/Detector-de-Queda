@@ -9,8 +9,9 @@
 //      * Nucleo 1 -> rede (servidor web + Telegram)
 //      * Monitor  -> coleta de metricas de hardware
 //  - Sincronizacao: mutex (barramento I2C e dados) + fila
-//  - Calibracao automatica do MPU6050 no boot
-//  - Algoritmo de queda livre + impacto (Bourke 2007 / Kangas 2008)
+//  - Algoritmo de queda: queda livre + impacto (Bourke 2007)
+//  - Testes: beep no boot + gatilho manual /testfall
+//  - Dashboard recolhivel (botao Expandir/Recolher)
 // ============================================================
 
 #define ESP_DRD_USE_SPIFFS true
@@ -34,37 +35,39 @@
 // -------------------------------------
 // ------------  Definicoes  -----------
 // -------------------------------------
-#define BUZZER_PIN 18                 // GPIO do buzzer (API LEDC v3.x usa pino, nao canal)
+#define BUZZER_PIN 18
 #define BEEP_DURATION 5000            // Tempo (ms) que o buzzer toca apos uma queda
 #define FALL_COOLDOWN 8000            // Tempo (ms) ignorando novas quedas apos um alerta
 
 #define JSON_CONFIG_FILE "/sample_config.json"
 
-#define DRD_TIMEOUT 10
-#define DRD_ADDRESS 0
-
-const int PIN_LED = 2;
+#define DRD_TIMEOUT 10                // Janela (s) para considerar um reset duplo
+#define DRD_ADDRESS 0                 // Endereco na memoria RTC do DoubleResetDetector
 
 // -------------------------------------
 // ------  Objetos / Variaveis  --------
 // -------------------------------------
 DoubleResetDetector *drd;
 MPU6050 mpu;
-WebServer server(80);
+WebServer server(80);                 // Servidor web na porta 80
 
-bool shouldSaveConfig = false;
+bool shouldSaveConfig = false;        // flag para salvar a configuracao
 
-// Dados configuraveis pelo usuario
+// Dados configuraveis pelo usuario (preenchidos pelo portal WiFiManager)
 char userName[50]       = "Usuario";
-char telegramToken[50]  = "TOKEN_AQUI";
+char telegramToken[60]  = "TOKEN_AQUI";    // buffer ampliado p/ evitar truncamento
 char telegramChatID[24] = "CHATID_AQUI";
 
-// Deteccao de queda
-const int sampleInterval  = 10;       // Intervalo (ms) entre leituras do acelerometro
-
-// Offsets de calibracao do MPU6050 (calculados no boot)
-int16_t accelOffset[3] = {0, 0, 0};
-int16_t gyroOffset[3]  = {0, 0, 0};
+// -------------------------------------
+// ------  PARAMETROS DE DETECCAO  -----
+// -------------------------------------
+const int sampleInterval = 20;            // 50 Hz (impacto dura poucos ms)
+const float ACCEL_LSB_PER_G = 16384.0;    // MPU em +-2g
+const float FREEFALL_G = 0.6;             // abaixo disso = queda livre
+const float IMPACT_G   = 1.8;             // impacto apos queda livre
+const float IMPACT_ALONE_G = 2.5;         // impacto forte isolado (sacudida brusca)
+const unsigned long FALL_WINDOW_MS = 2000;// tempo max entre queda livre e impacto
+bool DEBUG_FALL = true;                   // imprime a magnitude no serial p/ calibrar
 
 // Hora (NTP)
 const char* ntpServer        = "in.pool.ntp.org";
@@ -74,13 +77,15 @@ const int   daylightOffset_sec = 0;
 // -------------------------------------
 // -----  PARALELISMO / SINCRONISMO  ---
 // -------------------------------------
+//  Estrutura de estatisticas compartilhada. Por ser acessada por
+//  varios nucleos ao mesmo tempo, todo acesso passa pelo mutex.
 typedef struct {
   // --- Nucleo 0: tarefa de deteccao ---
-  uint32_t core0_loop_us;
-  uint32_t core0_iterations;
-  int      core0_id;
-  float    core0_cpu;
-  uint32_t core0_stack_free;
+  uint32_t core0_loop_us;     // Duracao da ultima iteracao (tempo de CPU)
+  uint32_t core0_iterations;  // Quantas vezes a tarefa ja rodou
+  int      core0_id;          // Nucleo em que a tarefa realmente roda
+  float    core0_cpu;         // % de uso da CPU pela tarefa
+  uint32_t core0_stack_free;  // Stack livre minima (bytes)
 
   // --- Nucleo 1: tarefa de rede ---
   uint32_t core1_loop_us;
@@ -93,78 +98,50 @@ typedef struct {
   uint32_t mon_stack_free;
 
   // --- Deteccao de queda / desempenho do alerta ---
-  float    jerkMagnitude;        // agora representa magnitude em g
-  uint32_t fallsDetected;
-  uint32_t alertsSent;
-  uint32_t lastDetection_us;
-  uint32_t lastAlertSend_ms;
-  uint32_t lastAlertLatency_ms;
+  float    jerkMagnitude;       // Ultima magnitude medida (g)
+  uint32_t fallsDetected;       // Total de quedas detectadas
+  uint32_t alertsSent;          // Total de alertas enviados
+  uint32_t lastDetection_us;    // Tempo de PROCESSAMENTO da deteccao (us)
+  uint32_t lastAlertSend_ms;    // Tempo de ENVIO da mensagem ao Telegram (ms)
+  uint32_t lastAlertLatency_ms; // Latencia TOTAL: queda -> mensagem enviada (ms)
 
-  // --- Acumuladores internos ---
+  // --- Acumuladores internos para o calculo de uso de CPU ---
   uint32_t busyAccum0;
   uint32_t busyAccum1;
 
-  // --- Metricas de hardware ---
-  float    temperature;
-  int8_t   wifiRssi;
+  // --- Metricas de hardware (preenchidas pela tarefa monitor) ---
+  float    temperature;         // Temperatura interna do chip (C)
+  int8_t   wifiRssi;            // Forca do sinal WiFi (dBm)
 } SystemStats;
 
 SystemStats stats = {0};
 
+volatile bool manualFallTrigger = false;   // setado pelo endpoint /testfall
+
+// Mutex que protege o BARRAMENTO I2C (compartilhado com o MPU6050)
 SemaphoreHandle_t i2cMutex;
+
+// Mutex que protege a estrutura 'stats' (regiao critica de dados)
 SemaphoreHandle_t statsMutex;
+
+// Fila usada para enviar o evento de queda do nucleo 0 -> nucleo 1
 QueueHandle_t fallQueue;
 
 typedef struct {
-  float jerk;
-  unsigned long timestamp;
+  float jerk;                  // agora carrega a magnitude do impacto (g)
+  unsigned long timestamp;     // millis() no momento da queda
 } FallEvent;
 
+// Handles das tarefas
 TaskHandle_t hTaskFall;
 TaskHandle_t hTaskNet;
 TaskHandle_t hTaskMon;
 
 // -------------------------------------
-// -------  CALIBRACAO DO MPU  ---------
-// -------------------------------------
-//  Mantenha o sensor PARADO e NIVELADO durante o boot.
-void calibrateMPU(int samples = 500) {
-  Serial.println("\n----- Calibracao do MPU6050 -----");
-  Serial.println("Mantenha o sensor PARADO e NIVELADO.");
-  Serial.println("Iniciando em 2 segundos...");
-  delay(2000);
-
-  long sumA[3] = {0, 0, 0};
-  long sumG[3] = {0, 0, 0};
-
-  for (int i = 0; i < samples; i++) {
-    int16_t ax, ay, az, gx, gy, gz;
-    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-    sumA[0] += ax; sumA[1] += ay; sumA[2] += az;
-    sumG[0] += gx; sumG[1] += gy; sumG[2] += gz;
-    delay(3);
-  }
-
-  accelOffset[0] = sumA[0] / samples;
-  accelOffset[1] = sumA[1] / samples;
-  // Z deve ler ~16384 (1g em escala +-2g) quando parado e nivelado
-  accelOffset[2] = (sumA[2] / samples) - 16384;
-
-  gyroOffset[0] = sumG[0] / samples;
-  gyroOffset[1] = sumG[1] / samples;
-  gyroOffset[2] = sumG[2] / samples;
-
-  Serial.printf("Offsets accel: X=%d  Y=%d  Z=%d\n",
-                accelOffset[0], accelOffset[1], accelOffset[2]);
-  Serial.printf("Offsets gyro : X=%d  Y=%d  Z=%d\n",
-                gyroOffset[0], gyroOffset[1], gyroOffset[2]);
-  Serial.println("Calibracao concluida.\n");
-}
-
-// -------------------------------------
 // ------------  Funcoes  --------------
 // -------------------------------------
 
+// Codifica uma string para uso seguro em URLs
 String urlEncode(const char* str) {
   const char* hex = "0123456789ABCDEF";
   String encodedStr = "";
@@ -183,6 +160,7 @@ String urlEncode(const char* str) {
   return encodedStr;
 }
 
+// Retorna a data/hora atual formatada
 String getDateTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "hora indisponivel";
@@ -191,11 +169,13 @@ String getDateTime() {
   return String(buf);
 }
 
+// Envia uma mensagem pelo Telegram e mede o tempo de envio.
+// Imprime a RESPOSTA COMPLETA da API para diagnostico de erros.
 void sendTelegramMessage(String message) {
   unsigned long t0 = millis();
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure();   // Nao valida o certificado (simplifica o prototipo)
 
   HTTPClient http;
   String url = "https://api.telegram.org/bot" + String(telegramToken) +
@@ -204,18 +184,18 @@ void sendTelegramMessage(String message) {
 
   http.begin(client, url);
   int httpCode = http.GET();
+  String payload = http.getString();      // resposta completa do Telegram
   unsigned long elapsed = millis() - t0;
   http.end();
 
-  if (httpCode > 0)
-    Serial.println("[TELEGRAM] Enviado. Codigo HTTP: " + String(httpCode) +
-                   " | Tempo: " + String(elapsed) + " ms");
-  else
-    Serial.println("[TELEGRAM] Falha. Codigo: " + String(httpCode));
+  Serial.println("[TELEGRAM] HTTP: " + String(httpCode) +
+                 " | Tempo: " + String(elapsed) + " ms");
+  Serial.println("[TELEGRAM] Resposta: " + payload);   // mostra o motivo do erro
 
+  // Atualiza estatisticas (regiao critica)
   if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
     stats.lastAlertSend_ms = elapsed;
-    if (httpCode > 0) stats.alertsSent++;
+    if (httpCode == 200) stats.alertsSent++;
     xSemaphoreGive(statsMutex);
   }
 }
@@ -309,6 +289,17 @@ const char dashboardPage[] PROGMEM = R"HTML(
   .c0{color:var(--c0);}.c1{color:var(--c1);}.w{color:var(--warn);}.mn{color:var(--mon);}
   .bar{height:6px;background:var(--line);border-radius:3px;margin-top:5px;overflow:hidden;}
   .bar>i{display:block;height:100%;border-radius:3px;}
+  .btn{display:inline-block;margin-top:8px;padding:8px 14px;background:var(--warn);
+    color:#0d1117;border:none;border-radius:6px;font-weight:bold;cursor:pointer;
+    font-family:inherit;}
+  .btn:active{opacity:.7;}
+  .toolbar{display:flex;justify-content:flex-end;margin-bottom:14px;}
+  .toggle{padding:9px 18px;background:var(--c0);color:#0d1117;border:none;
+    border-radius:6px;font-weight:bold;cursor:pointer;font-family:inherit;
+    font-size:.85rem;letter-spacing:.5px;}
+  .toggle:active{opacity:.7;}
+  .extra{display:none;}        /* escondido por padrao */
+  .extra.show{display:block;}  /* revelado ao expandir */
   footer{margin-top:20px;color:var(--muted);font-size:.74rem;text-align:center;}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
     background:var(--c1);margin-right:6px;animation:pulse 1s infinite;}
@@ -321,71 +312,19 @@ const char dashboardPage[] PROGMEM = R"HTML(
   <p><span class="dot"></span>Monitoramento em tempo real &middot; ESP32 dual-core &middot; FreeRTOS</p>
 </header>
 
+<div class="toolbar">
+  <button class="toggle" id="btnExp" onclick="toggleExtra()">Expandir &#9660;</button>
+</div>
+
 <div class="grid">
-  <div class="card c0t">
-    <h2>Nucleo 0 &mdash; Tarefa de Deteccao</h2>
-    <div class="row"><span>Roda no core</span><span class="c0" id="core0_id">-</span></div>
-    <div class="row"><span>Tempo de iteracao</span><span class="c0"><span id="core0_us">-</span> us</span></div>
-    <div class="row"><span>Iteracoes</span><span id="core0_iter">-</span></div>
-    <div class="row"><span>Uso de CPU</span><span class="c0"><span id="core0_cpu">-</span> %</span></div>
-    <div class="bar"><i id="core0_bar" style="width:0;background:var(--c0)"></i></div>
-    <div class="row"><span>Stack livre</span><span><span id="core0_stk">-</span> B</span></div>
-  </div>
-
-  <div class="card c1t">
-    <h2>Nucleo 1 &mdash; Tarefa de Rede</h2>
-    <div class="row"><span>Roda no core</span><span class="c1" id="core1_id">-</span></div>
-    <div class="row"><span>Tempo de iteracao</span><span class="c1"><span id="core1_us">-</span> us</span></div>
-    <div class="row"><span>Iteracoes</span><span id="core1_iter">-</span></div>
-    <div class="row"><span>Uso de CPU</span><span class="c1"><span id="core1_cpu">-</span> %</span></div>
-    <div class="bar"><i id="core1_bar" style="width:0;background:var(--c1)"></i></div>
-    <div class="row"><span>Stack livre</span><span><span id="core1_stk">-</span> B</span></div>
-  </div>
-
-  <div class="card wt">
-    <h2>Desempenho do Alerta</h2>
-    <div class="row"><span>Tempo de deteccao</span><span class="w"><span id="det">-</span> us</span></div>
-    <div class="row"><span>Envio ao Telegram</span><span class="w"><span id="send">-</span> ms</span></div>
-    <div class="row"><span>Latencia total</span><span class="w"><span id="lat">-</span> ms</span></div>
-    <div class="row"><span>Magnitude atual (g)</span><span id="jerk">-</span></div>
-  </div>
-
+  <!-- EVENTOS (sempre visivel) -->
   <div class="card">
     <h2>Eventos</h2>
     <div class="row"><span>Quedas detectadas</span><span class="w" id="falls">-</span></div>
     <div class="row"><span>Alertas enviados</span><span class="c1" id="alerts">-</span></div>
   </div>
 
-  <div class="card">
-    <h2>Memoria RAM (Heap)</h2>
-    <div class="row"><span>Total</span><span><span id="heapT">-</span> KB</span></div>
-    <div class="row"><span>Livre</span><span><span id="heapF">-</span> KB</span></div>
-    <div class="row"><span>Minimo ja livre</span><span><span id="heapM">-</span> KB</span></div>
-    <div class="row"><span>Maior bloco livre</span><span><span id="heapB">-</span> KB</span></div>
-    <div class="row"><span>Uso</span><span><span id="heapP">-</span> %</span></div>
-    <div class="bar"><i id="heap_bar" style="width:0;background:var(--warn)"></i></div>
-  </div>
-
-  <div class="card">
-    <h2>PSRAM</h2>
-    <div class="row"><span>Total</span><span id="psT">-</span></div>
-    <div class="row"><span>Livre</span><span id="psF">-</span></div>
-  </div>
-
-  <div class="card">
-    <h2>Flash / Programa</h2>
-    <div class="row"><span>Tamanho da Flash</span><span><span id="flT">-</span> MB</span></div>
-    <div class="row"><span>Velocidade Flash</span><span><span id="flS">-</span> MHz</span></div>
-    <div class="row"><span>Tamanho do sketch</span><span><span id="skT">-</span> KB</span></div>
-    <div class="row"><span>Espaco livre p/ OTA</span><span><span id="skF">-</span> KB</span></div>
-  </div>
-
-  <div class="card">
-    <h2>Armazenamento (SPIFFS)</h2>
-    <div class="row"><span>Total</span><span><span id="spT">-</span> KB</span></div>
-    <div class="row"><span>Usado</span><span><span id="spU">-</span> KB</span></div>
-  </div>
-
+  <!-- CHIP / SISTEMA (sempre visivel) -->
   <div class="card mt">
     <h2>Chip / Sistema</h2>
     <div class="row"><span>Modelo</span><span class="mn" id="chip">-</span></div>
@@ -399,11 +338,81 @@ const char dashboardPage[] PROGMEM = R"HTML(
     <div class="row"><span>Tempo ligado</span><span id="uptime">-</span></div>
   </div>
 
+  <!-- REDE WIFI (sempre visivel) -->
   <div class="card">
     <h2>Rede WiFi</h2>
     <div class="row"><span>Endereco IP</span><span id="ip">-</span></div>
     <div class="row"><span>Rede (SSID)</span><span id="ssid">-</span></div>
     <div class="row"><span>Sinal (RSSI)</span><span><span id="rssi">-</span> dBm</span></div>
+  </div>
+
+  <!-- ===== CARDS EXTRAS (ocultos ate expandir) ===== -->
+
+  <!-- NUCLEO 0 -->
+  <div class="card c0t extra">
+    <h2>Nucleo 0 &mdash; Tarefa de Deteccao</h2>
+    <div class="row"><span>Roda no core</span><span class="c0" id="core0_id">-</span></div>
+    <div class="row"><span>Tempo de iteracao</span><span class="c0"><span id="core0_us">-</span> us</span></div>
+    <div class="row"><span>Iteracoes</span><span id="core0_iter">-</span></div>
+    <div class="row"><span>Uso de CPU</span><span class="c0"><span id="core0_cpu">-</span> %</span></div>
+    <div class="bar"><i id="core0_bar" style="width:0;background:var(--c0)"></i></div>
+    <div class="row"><span>Stack livre</span><span><span id="core0_stk">-</span> B</span></div>
+  </div>
+
+  <!-- NUCLEO 1 -->
+  <div class="card c1t extra">
+    <h2>Nucleo 1 &mdash; Tarefa de Rede</h2>
+    <div class="row"><span>Roda no core</span><span class="c1" id="core1_id">-</span></div>
+    <div class="row"><span>Tempo de iteracao</span><span class="c1"><span id="core1_us">-</span> us</span></div>
+    <div class="row"><span>Iteracoes</span><span id="core1_iter">-</span></div>
+    <div class="row"><span>Uso de CPU</span><span class="c1"><span id="core1_cpu">-</span> %</span></div>
+    <div class="bar"><i id="core1_bar" style="width:0;background:var(--c1)"></i></div>
+    <div class="row"><span>Stack livre</span><span><span id="core1_stk">-</span> B</span></div>
+  </div>
+
+  <!-- DESEMPENHO DO ALERTA -->
+  <div class="card wt extra">
+    <h2>Desempenho do Alerta</h2>
+    <div class="row"><span>Tempo de deteccao</span><span class="w"><span id="det">-</span> us</span></div>
+    <div class="row"><span>Envio ao Telegram</span><span class="w"><span id="send">-</span> ms</span></div>
+    <div class="row"><span>Latencia total</span><span class="w"><span id="lat">-</span> ms</span></div>
+    <div class="row"><span>Magnitude atual</span><span><span id="jerk">-</span> g</span></div>
+    <button class="btn" onclick="testFall()">Simular queda (teste)</button>
+    <div id="testmsg" style="margin-top:6px;font-size:.8rem;color:var(--muted);"></div>
+  </div>
+
+  <!-- MEMORIA RAM -->
+  <div class="card extra">
+    <h2>Memoria RAM (Heap)</h2>
+    <div class="row"><span>Total</span><span><span id="heapT">-</span> KB</span></div>
+    <div class="row"><span>Livre</span><span><span id="heapF">-</span> KB</span></div>
+    <div class="row"><span>Minimo ja livre</span><span><span id="heapM">-</span> KB</span></div>
+    <div class="row"><span>Maior bloco livre</span><span><span id="heapB">-</span> KB</span></div>
+    <div class="row"><span>Uso</span><span><span id="heapP">-</span> %</span></div>
+    <div class="bar"><i id="heap_bar" style="width:0;background:var(--warn)"></i></div>
+  </div>
+
+  <!-- PSRAM -->
+  <div class="card extra">
+    <h2>PSRAM</h2>
+    <div class="row"><span>Total</span><span id="psT">-</span></div>
+    <div class="row"><span>Livre</span><span id="psF">-</span></div>
+  </div>
+
+  <!-- FLASH / PROGRAMA -->
+  <div class="card extra">
+    <h2>Flash / Programa</h2>
+    <div class="row"><span>Tamanho da Flash</span><span><span id="flT">-</span> MB</span></div>
+    <div class="row"><span>Velocidade Flash</span><span><span id="flS">-</span> MHz</span></div>
+    <div class="row"><span>Tamanho do sketch</span><span><span id="skT">-</span> KB</span></div>
+    <div class="row"><span>Espaco livre p/ OTA</span><span><span id="skF">-</span> KB</span></div>
+  </div>
+
+  <!-- SPIFFS -->
+  <div class="card extra">
+    <h2>Armazenamento (SPIFFS)</h2>
+    <div class="row"><span>Total</span><span><span id="spT">-</span> KB</span></div>
+    <div class="row"><span>Usado</span><span><span id="spU">-</span> KB</span></div>
   </div>
 </div>
 
@@ -413,34 +422,58 @@ const char dashboardPage[] PROGMEM = R"HTML(
 function up(s){let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;
   return h+"h "+m+"m "+x+"s";}
 function set(id,v){document.getElementById(id).textContent=v;}
+function toggleExtra(){
+  const on=document.querySelectorAll('.extra');
+  const btn=document.getElementById('btnExp');
+  const showing=on.length && on[0].classList.contains('show');
+  on.forEach(e=>e.classList.toggle('show', !showing));
+  btn.innerHTML = showing ? 'Expandir &#9660;' : 'Recolher &#9650;';
+}
+async function testFall(){
+  const m=document.getElementById('testmsg');
+  m.textContent='Disparando...';
+  try{
+    const r=await fetch('/testfall');
+    m.textContent=await r.text();
+  }catch(e){ m.textContent='Falha: '+e; }
+}
 async function refresh(){
   try{
     const d = await (await fetch('/stats')).json();
+    // Nucleo 0
     set('core0_id',d.core0_id); set('core0_us',d.core0_us);
     set('core0_iter',d.core0_iter.toLocaleString()); set('core0_cpu',d.core0_cpu.toFixed(1));
     set('core0_stk',d.core0_stk.toLocaleString());
     document.getElementById('core0_bar').style.width=Math.min(d.core0_cpu,100)+'%';
+    // Nucleo 1
     set('core1_id',d.core1_id); set('core1_us',d.core1_us);
     set('core1_iter',d.core1_iter.toLocaleString()); set('core1_cpu',d.core1_cpu.toFixed(1));
     set('core1_stk',d.core1_stk.toLocaleString());
     document.getElementById('core1_bar').style.width=Math.min(d.core1_cpu,100)+'%';
+    // Alerta
     set('det',d.det.toLocaleString()); set('send',d.send); set('lat',d.lat);
     set('jerk',d.jerk.toFixed(2));
     set('falls',d.falls); set('alerts',d.alerts);
+    // Heap
     let hp=(100*(d.heapT-d.heapF)/d.heapT);
     set('heapT',(d.heapT/1024).toFixed(1)); set('heapF',(d.heapF/1024).toFixed(1));
     set('heapM',(d.heapM/1024).toFixed(1)); set('heapB',(d.heapB/1024).toFixed(1));
     set('heapP',hp.toFixed(1));
     document.getElementById('heap_bar').style.width=hp+'%';
+    // PSRAM
     set('psT',d.psT>0?(d.psT/1048576).toFixed(2)+' MB':'Sem PSRAM');
     set('psF',d.psT>0?(d.psF/1048576).toFixed(2)+' MB':'-');
+    // Flash
     set('flT',(d.flT/1048576).toFixed(1)); set('flS',d.flS);
     set('skT',(d.skT/1024).toFixed(1)); set('skF',(d.skF/1024).toFixed(1));
+    // SPIFFS
     set('spT',(d.spT/1024).toFixed(1)); set('spU',(d.spU/1024).toFixed(1));
+    // Chip
     set('chip',d.chip); set('rev',d.rev); set('cores',d.cores);
     set('cpu',d.cpu); set('temp',d.temp.toFixed(1)); set('sdk',d.sdk);
     set('tasks',d.tasks); set('mon_stk',d.mon_stk.toLocaleString());
     set('uptime',up(d.uptime));
+    // WiFi
     set('ip',d.ip); set('ssid',d.ssid); set('rssi',d.rssi);
   }catch(e){ console.log('falha ao buscar /stats',e); }
 }
@@ -450,8 +483,16 @@ setInterval(refresh,1000); refresh();
 </html>
 )HTML";
 
+// Handler: forca uma queda fake (teste sem derrubar a placa)
+void handleTestFall() {
+  manualFallTrigger = true;
+  server.send(200, "text/plain", "Queda de teste disparada!");
+}
+
+// Handler: pagina principal do dashboard
 void handleRoot() { server.send_P(200, "text/html", dashboardPage); }
 
+// Handler: endpoint JSON com TODAS as estatisticas em tempo real
 void handleStats() {
   SystemStats s;
   if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
@@ -460,34 +501,42 @@ void handleStats() {
   }
 
   String j = "{";
+  // Nucleo 0
   j += "\"core0_id\":"   + String(s.core0_id) + ",";
   j += "\"core0_us\":"   + String(s.core0_loop_us) + ",";
   j += "\"core0_iter\":" + String(s.core0_iterations) + ",";
   j += "\"core0_cpu\":"  + String(s.core0_cpu) + ",";
   j += "\"core0_stk\":"  + String(s.core0_stack_free) + ",";
+  // Nucleo 1
   j += "\"core1_id\":"   + String(s.core1_id) + ",";
   j += "\"core1_us\":"   + String(s.core1_loop_us) + ",";
   j += "\"core1_iter\":" + String(s.core1_iterations) + ",";
   j += "\"core1_cpu\":"  + String(s.core1_cpu) + ",";
   j += "\"core1_stk\":"  + String(s.core1_stack_free) + ",";
+  // Desempenho do alerta
   j += "\"det\":"        + String(s.lastDetection_us) + ",";
   j += "\"send\":"       + String(s.lastAlertSend_ms) + ",";
   j += "\"lat\":"        + String(s.lastAlertLatency_ms) + ",";
   j += "\"jerk\":"       + String(s.jerkMagnitude) + ",";
   j += "\"falls\":"      + String(s.fallsDetected) + ",";
   j += "\"alerts\":"     + String(s.alertsSent) + ",";
+  // Heap
   j += "\"heapT\":"      + String(ESP.getHeapSize()) + ",";
   j += "\"heapF\":"      + String(ESP.getFreeHeap()) + ",";
   j += "\"heapM\":"      + String(ESP.getMinFreeHeap()) + ",";
   j += "\"heapB\":"      + String(ESP.getMaxAllocHeap()) + ",";
+  // PSRAM
   j += "\"psT\":"        + String(ESP.getPsramSize()) + ",";
   j += "\"psF\":"        + String(ESP.getFreePsram()) + ",";
+  // Flash / programa
   j += "\"flT\":"        + String(ESP.getFlashChipSize()) + ",";
   j += "\"flS\":"        + String(ESP.getFlashChipSpeed() / 1000000) + ",";
   j += "\"skT\":"        + String(ESP.getSketchSize()) + ",";
   j += "\"skF\":"        + String(ESP.getFreeSketchSpace()) + ",";
+  // SPIFFS
   j += "\"spT\":"        + String((uint32_t)SPIFFS.totalBytes()) + ",";
   j += "\"spU\":"        + String((uint32_t)SPIFFS.usedBytes()) + ",";
+  // Chip / sistema
   j += "\"chip\":\""     + String(ESP.getChipModel()) + "\",";
   j += "\"rev\":"        + String(ESP.getChipRevision()) + ",";
   j += "\"cores\":"      + String(ESP.getChipCores()) + ",";
@@ -497,6 +546,7 @@ void handleStats() {
   j += "\"tasks\":"      + String(uxTaskGetNumberOfTasks()) + ",";
   j += "\"mon_stk\":"    + String(s.mon_stack_free) + ",";
   j += "\"uptime\":"     + String(millis() / 1000) + ",";
+  // WiFi
   j += "\"ip\":\""       + WiFi.localIP().toString() + "\",";
   j += "\"ssid\":\""     + WiFi.SSID() + "\",";
   j += "\"rssi\":"       + String(s.wifiRssi);
@@ -507,71 +557,86 @@ void handleStats() {
 
 // ============================================================
 //  TAREFA 1  (Nucleo 0)  -  Deteccao de queda
-//  Algoritmo: queda livre (< 0.5g) -> impacto (> 2.0g) dentro
-//  de uma janela de 1.5s. Padrao academico (Bourke 2007).
+//  Algoritmo: queda livre (mag < FREEFALL_G) seguida de
+//  impacto (mag > IMPACT_G) dentro de FALL_WINDOW_MS.
+//  + impacto forte isolado e gatilho manual via web.
 // ============================================================
 void taskFallDetection(void *param) {
   bool buzzerOn = false;
   unsigned long buzzerStart = 0;
   unsigned long lastFallTime = 0;
 
-  // ----- Estado do algoritmo -----
-  bool inFreeFall = false;
-  unsigned long freeFallStart = 0;
-  const float FREE_FALL_G   = 0.5f;    // abaixo disso = queda livre
-  const float IMPACT_G      = 2.0f;    // acima disso = impacto
-  const uint32_t FF_WINDOW_MS = 1500;  // janela entre queda livre e impacto
+  // Maquina de estados: queda livre -> impacto
+  bool freefallActive = false;
+  unsigned long freefallTime = 0;
 
   for (;;) {
-    uint32_t tIter = micros();
-    uint32_t tDetect = micros();
+    uint32_t tIter   = micros();   // inicio da iteracao (tempo de CPU)
+    uint32_t tDetect = micros();   // cronometra o processamento da deteccao
 
     int16_t ax, ay, az;
+    // Acesso ao BARRAMENTO I2C protegido por mutex
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       mpu.getAcceleration(&ax, &ay, &az);
       xSemaphoreGive(i2cMutex);
     }
 
-    // Aplica offsets de calibracao
-    ax -= accelOffset[0];
-    ay -= accelOffset[1];
-    az -= accelOffset[2];
+    // raw -> g  e magnitude do vetor (~1.0 em repouso)
+    float gx = ax / ACCEL_LSB_PER_G;
+    float gy = ay / ACCEL_LSB_PER_G;
+    float gz = az / ACCEL_LSB_PER_G;
+    float mag = sqrt(gx*gx + gy*gy + gz*gz);
 
-    // Magnitude da aceleracao em g (escala +-2g => 16384 LSB/g)
-    float aMag = sqrt((float)ax*ax + (float)ay*ay + (float)az*az) / 16384.0;
+    if (DEBUG_FALL)
+      Serial.printf("mag=%.2fg  ax=%.2f ay=%.2f az=%.2f\n", mag, gx, gy, gz);
 
     bool fall = false;
-    unsigned long now = millis();
 
-    // ----- Maquina de estados -----
-    if (!inFreeFall && aMag < FREE_FALL_G) {
-      inFreeFall = true;
-      freeFallStart = now;
-      Serial.printf("[CORE0] Queda livre detectada (mag=%.2fg)\n", aMag);
+    // 0) gatilho manual via web (/testfall)
+    if (manualFallTrigger) {
+      manualFallTrigger = false;
+      fall = true;
+      Serial.println("[CORE0] Queda MANUAL (teste via web)");
     }
 
-    if (inFreeFall) {
-      if (aMag > IMPACT_G && (now - lastFallTime > FALL_COOLDOWN)) {
-        Serial.printf("[CORE0] IMPACTO! mag=%.2fg\n", aMag);
+    // 1) fase de queda livre
+    if (!freefallActive && mag < FREEFALL_G) {
+      freefallActive = true;
+      freefallTime = millis();
+      Serial.printf("[CORE0] Queda livre (mag=%.2fg)\n", mag);
+    }
+
+    // 2) impacto apos queda livre, dentro da janela
+    if (freefallActive) {
+      if (mag > IMPACT_G) {
         fall = true;
-        inFreeFall = false;
-      } else if (now - freeFallStart > FF_WINDOW_MS) {
-        // Timeout - nao houve impacto, descarta
-        inFreeFall = false;
+        freefallActive = false;
+        Serial.printf("[CORE0] IMPACTO! mag=%.2fg\n", mag);
+      } else if (millis() - freefallTime > FALL_WINDOW_MS) {
+        freefallActive = false;   // janela expirou, descarta
       }
     }
 
-    uint32_t detectDur = micros() - tDetect;
+    // 3) impacto forte isolado (sacudida brusca, sem queda livre)
+    if (!fall && mag > IMPACT_ALONE_G) {
+      fall = true;
+      Serial.printf("[CORE0] IMPACTO ISOLADO! mag=%.2fg\n", mag);
+    }
 
-    if (fall) {
-      lastFallTime = now;
+    uint32_t detectDur = micros() - tDetect;  // tempo gasto para detectar
 
-      ledcWriteTone(BUZZER_PIN, 3000);
+    // ---- Trata a queda ----
+    if (fall && (millis() - lastFallTime > FALL_COOLDOWN)) {
+      Serial.println("[CORE0] Queda detectada! Tempo de deteccao: " +
+                     String(detectDur) + " us");
+      lastFallTime = millis();
+
+      ledcWriteTone(BUZZER_PIN, 3000);   // aciona o buzzer
       buzzerOn = true;
       buzzerStart = millis();
 
-      FallEvent ev = { aMag, millis() };
-      xQueueSend(fallQueue, &ev, 0);
+      FallEvent ev = { mag, millis() };  // ev.jerk carrega a magnitude (g)
+      xQueueSend(fallQueue, &ev, 0);     // envia o evento ao nucleo 1
 
       if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
         stats.fallsDetected++;
@@ -580,18 +645,20 @@ void taskFallDetection(void *param) {
       }
     }
 
+    // Desliga o buzzer apos BEEP_DURATION (sem travar a tarefa)
     if (buzzerOn && (millis() - buzzerStart > BEEP_DURATION)) {
       ledcWrite(BUZZER_PIN, 0);
       buzzerOn = false;
     }
 
+    // ---- Atualiza estatisticas deste nucleo ----
     uint32_t iterUs = micros() - tIter;
     if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
       stats.core0_loop_us = iterUs;
       stats.core0_iterations++;
       stats.core0_id = xPortGetCoreID();
       stats.core0_stack_free = uxTaskGetStackHighWaterMark(NULL);
-      stats.jerkMagnitude = aMag;
+      stats.jerkMagnitude = mag;   // dashboard "Magnitude atual" mostra g
       stats.busyAccum0 += iterUs;
       xSemaphoreGive(statsMutex);
     }
@@ -608,16 +675,18 @@ void taskNetwork(void *param) {
     uint32_t tIter = micros();
 
     drd->loop();
-    server.handleClient();
-    uint32_t workUs = micros() - tIter;
+    server.handleClient();                 // atende o dashboard
+    uint32_t workUs = micros() - tIter;    // tempo de CPU (sem o envio de rede)
 
+    // Verifica se chegou um evento de queda pela fila
     FallEvent ev;
     if (xQueueReceive(fallQueue, &ev, 0) == pdTRUE) {
       Serial.println("[CORE1] Evento de queda recebido. Enviando Telegram...");
       String msg = "ALERTA! Queda detectada para o usuario: " + String(userName) +
                    " em " + getDateTime() + ". Impacto: " + String(ev.jerk, 2) + "g";
-      sendTelegramMessage(msg);
+      sendTelegramMessage(msg);            // bloqueante - nao conta como uso de CPU
 
+      // Latencia total: do instante da queda ate a mensagem sair
       uint32_t latency = millis() - ev.timestamp;
       if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
         stats.lastAlertLatency_ms = latency;
@@ -626,6 +695,7 @@ void taskNetwork(void *param) {
       Serial.println("[CORE1] Latencia total do alerta: " + String(latency) + " ms");
     }
 
+    // Atualiza estatisticas deste nucleo
     if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
       stats.core1_loop_us = workUs;
       stats.core1_iterations++;
@@ -641,12 +711,15 @@ void taskNetwork(void *param) {
 
 // ============================================================
 //  TAREFA 3  -  Monitor de hardware
+//  A cada 1s calcula o uso de CPU de cada nucleo e coleta
+//  temperatura, sinal WiFi e a stack das tarefas.
 // ============================================================
 void taskMonitor(void *param) {
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(1000));   // janela de medicao de 1 segundo
 
     if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
+      // uso de CPU = tempo ocupado / 1.000.000 us -> em %
       stats.core0_cpu = stats.busyAccum0 / 10000.0;
       stats.core1_cpu = stats.busyAccum1 / 10000.0;
       if (stats.core0_cpu > 100) stats.core0_cpu = 100;
@@ -655,7 +728,7 @@ void taskMonitor(void *param) {
       stats.busyAccum1 = 0;
 
       stats.mon_stack_free = uxTaskGetStackHighWaterMark(NULL);
-      stats.temperature    = temperatureRead();
+      stats.temperature    = temperatureRead();   // sensor interno do ESP32
       stats.wifiRssi       = WiFi.RSSI();
       xSemaphoreGive(statsMutex);
     }
@@ -669,19 +742,19 @@ void setup() {
   Serial.begin(115200);
   delay(10);
 
-  Wire.begin(21, 17);   // SDA -> GPIO 21, SCL -> GPIO 17
+  Wire.begin(21, 22);   // SDA -> GPIO 21, SCL -> GPIO 22 (pinos I2C padrao do ESP32)
 
   mpu.initialize();
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);   // +-2g (casa com ACCEL_LSB_PER_G)
   Serial.println(mpu.testConnection() ? "MPU6050 conectado" : "Falha no MPU6050");
 
-  // Calibracao do MPU6050 (sensor deve estar parado e nivelado)
-  calibrateMPU();
+  ledcAttach(BUZZER_PIN, 2000, 13);   // pino, freq base, resolucao (API Core 3.x)
 
-  // API LEDC v3.x: chamada unica com pino + freq + resolucao
-  ledcAttach(BUZZER_PIN, 2000, 13);
-
-  pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, LOW);
+  // ---- TESTE: beep de inicializacao (confirma buzzer/LEDC) ----
+  Serial.println("[BOOT] Testando buzzer...");
+  ledcWriteTone(BUZZER_PIN, 3000);
+  delay(600);
+  ledcWrite(BUZZER_PIN, 0);
 
   bool forceConfig = false;
 
@@ -710,7 +783,7 @@ void setup() {
   wm.addParameter(&config_info_top);
 
   WiFiManagerParameter box_name ("key_name",  "Nome do usuario",    userName,       50);
-  WiFiManagerParameter box_token("key_token", "Telegram Bot Token", telegramToken,  49);
+  WiFiManagerParameter box_token("key_token", "Telegram Bot Token", telegramToken,  59);
   WiFiManagerParameter box_chat ("key_chat",  "Telegram Chat ID",   telegramChatID, 23);
   wm.addParameter(&box_name);
   wm.addParameter(&box_token);
@@ -729,7 +802,6 @@ void setup() {
   }
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  digitalWrite(PIN_LED, HIGH);
 
   Serial.println("\nWiFi conectado");
   Serial.print("Dashboard disponivel em: http://");
@@ -738,19 +810,30 @@ void setup() {
   strncpy(userName,       box_name.getValue(),  sizeof(userName));
   strncpy(telegramToken,  box_token.getValue(), sizeof(telegramToken));
   strncpy(telegramChatID, box_chat.getValue(),  sizeof(telegramChatID));
+
+  // ---- DIAGNOSTICO: mostra o que foi realmente carregado ----
   Serial.println("Usuario: " + String(userName));
+  Serial.printf("[CFG] Token=[%s]\n", telegramToken);
+  Serial.printf("[CFG] ChatID=[%s]\n", telegramChatID);
 
   if (shouldSaveConfig) saveConfigFile();
 
+  // ----- Servidor web -----
   server.on("/", handleRoot);
   server.on("/stats", handleStats);
+  server.on("/testfall", handleTestFall);   // gatilho manual de queda
   server.begin();
   Serial.println("Servidor web iniciado.");
 
+  // ----- Objetos de sincronizacao -----
   i2cMutex   = xSemaphoreCreateMutex();
   statsMutex = xSemaphoreCreateMutex();
   fallQueue  = xQueueCreate(5, sizeof(FallEvent));
 
+  // ----- Cria as 3 vTasks (operacao do sistema) -----
+  //  Tarefa de deteccao -> nucleo 0
+  //  Tarefa de rede     -> nucleo 1
+  //  Tarefa de monitor  -> sem afinidade (escalonada pelo FreeRTOS)
   xTaskCreatePinnedToCore(taskFallDetection, "Deteccao", 4096, NULL, 3, &hTaskFall, 0);
   xTaskCreatePinnedToCore(taskNetwork,       "Rede",     8192, NULL, 2, &hTaskNet,  1);
   xTaskCreatePinnedToCore(taskMonitor,       "Monitor",  3072, NULL, 1, &hTaskMon,  tskNO_AFFINITY);
@@ -758,6 +841,11 @@ void setup() {
   Serial.println("3 vTasks criadas. Sistema em execucao paralela.");
 }
 
+// -------------------------------------
+// --------------  LOOP  ---------------
+// -------------------------------------
+//  Toda a operacao do sistema ocorre dentro das vTasks.
+//  O loop() apenas cede a CPU.
 void loop() {
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
