@@ -194,7 +194,3 @@ Ele faz o mesmo que uma queda real, sem precisar mexer no aparelho.
 - `buzzer` = o som de alerta
 - `Telegram` = onde chega a mensagem
 - `dashboard` = painel web para ver os dados
-
----
-
-Se quiser, posso deixar ainda mais visual com um desenho de fluxo maior ou com exemplo de tela do painel.
